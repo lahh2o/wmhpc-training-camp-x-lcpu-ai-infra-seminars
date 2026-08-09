@@ -70,6 +70,124 @@ SIMD 是一条指令显式处理多个数据元素，通常共享同一控制流
 
 结论：GPU 单 thread 比 CPU 单 thread 慢很多，因为 GPU 为高吞吐而非低延迟设计；只有一个 thread 时，大多数资源闲置，且访存延迟无法被隐藏。单 block 到铺满 grid 的耗时从 2.318 ms 降至 0.026 ms，约提升 89 倍：后者有 16,384 个 block，足以让 170 个 SM 持续工作，并通过大量 warp 隐藏访存延迟。
 
+## Module 2: 第一个 CUDA kernel
+
+### 核心概念
+- **host / CPU**：运行普通 C++ 代码、启动 kernel 的一方。
+- **device / GPU**：实际并行执行 kernel 的一方。
+- **指针**：保存一片数据起始地址的变量。例如 `float *d_a` 表示“指向 float 数据的地址”。
+- **`malloc(bytes)`**：向 CPU 内存申请一片空间。
+- **`cudaMalloc(&d_a, bytes)`**：向 GPU 全局显存申请一片空间，并把 GPU 地址写入 `d_a`。
+- **`cudaMallocManaged(&a, bytes)`**：申请 Unified Memory；CPU 和 GPU 都可通过同一个指针 `a` 访问。
+- **`cudaMemcpy`**：显式在 CPU 内存与 GPU 显存间搬运数据。
+- **kernel launch**：`kernel<<<blocks, threads>>>(...)`。第一个参数是 grid 中 block 数，第二个是每个 block 的 thread 数。
+- **异步执行**：kernel launch 后 CPU 通常立刻继续执行；GPU 在另一条时间线上执行 kernel。
+- **`cudaDeviceSynchronize()`**：让 CPU 等待此前 GPU 工作全部完成。课程的 `CUDA_CHECK_KERNEL()` 同时检查 kernel 错误并调用它。
+
+### 2.1 一维向量加法
+每个 thread 负责一个元素：
+
+```cpp
+int idx = blockIdx.x * blockDim.x + threadIdx.x;
+if (idx < n) c[idx] = a[idx] + b[idx];
+```
+
+对任意 `n`，block 数采用向上取整：
+
+```cpp
+(n + threadsPerBlock - 1) / threadsPerBlock
+```
+
+这样最后不足一个 block 的元素也有 thread 覆盖，而越界 thread 被 `idx < n` 排除。
+
+### 2.2 CUDA 修饰符
+| 修饰符 | 用途 |
+|---|---|
+| `__global__` | CPU 启动、GPU 执行的 kernel |
+| `__device__` | 仅在 GPU 执行、仅能被 GPU 函数调用的辅助函数 |
+| `__host__ __device__` | CPU 与 GPU 均可调用的函数 |
+| `__constant__` | GPU 上全局共享的只读变量，通常定义在函数外 |
+| `__shared__` | GPU 上每个 block 独享、同一 block 内 thread 共享的变量 |
+
+普通局部变量若定义在 kernel 内，通常每个 thread 各有一份，优先放在寄存器中；`cudaMalloc` 分配的是所有 block 可访问的 global memory。
+
+### 2.3 Unified Memory
+显式管理版本具有 CPU 数组 `h_a/h_b/h_c` 与 GPU 数组 `d_a/d_b/d_c`，需要两次 H→D 和一次 D→H 的 `cudaMemcpy`。
+
+Unified Memory 版本改为只使用 `a/b/c`：
+
+```text
+CPU 填 a、b → GPU kernel 读 a、b 并写 c → CPU 读 c
+```
+
+CUDA 运行时按实际访问需求迁移数据页，因此删去所有 `cudaMemcpy`；kernel 后、CPU 读取 `c` 前仍必须同步。
+
+在 RTX 5090 上的三次测量：
+
+| 版本 | 三次耗时 (ms) | 平均 (ms) |
+|---|---:|---:|
+| Unified Memory | 97.0、99.3、95.2 | 97.2 |
+| 显式 `cudaMemcpy` | 98.7、98.2、98.4 | 98.4 |
+
+结论：本实验中两种方案性能基本相当，Unified Memory 平均略快约 1.3%，但波动范围重叠，不能据此断言它稳定更快。Unified Memory 的主要优势是简化代码；性能依赖硬件、驱动与访问模式。
+
+### 2.4 异步与 stream
+- kernel launch 默认异步：CPU 不等待 kernel 完成。
+- 同一 stream 内任务按提交顺序执行；D→H `cudaMemcpy` 会等待此前 kernel 完成。
+- kernel 内部非法访存发生在 GPU 实际执行时，通常在 `cudaDeviceSynchronize()`、D→H `cudaMemcpy` 等同步点才报告。
+
+### 2.5 定位非法 kernel 启动
+原程序设置 `threads = 2048`，超过 RTX 5090 的 `maxThreadsPerBlock = 1024`，导致 kernel 没有启动。
+
+`d_c` 已被 `cudaMemset` 为 0；未检查错误时，复制回来就表现为 `MISMATCH`。加入 `CUDA_CHECK_KERNEL()` 后，立即报告 `cudaErrorInvalidValue`。将 thread 数改为 256 后通过测试。
+
+### 2.6 二维矩阵加法
+二维 thread 坐标通常约定：
+
+```cpp
+row = blockIdx.y * blockDim.y + threadIdx.y;
+col = blockIdx.x * blockDim.x + threadIdx.x;
+```
+
+矩阵按行优先存为一维数组：
+
+```cpp
+idx = row * N + col;
+```
+
+`dim3 threads(16, 16)` 表示一个 block 有 16 列 × 16 行，即 256 个 thread。
+
+对于 `M = 1000` 行、`N = 700` 列：
+
+```text
+blocks.x = ceil(N / 16) = 44，覆盖列
+blocks.y = ceil(M / 16) = 63，覆盖行
+```
+
+必须使用二维边界保护：
+
+```cpp
+if (row < M && col < N) { ... }
+```
+
+### 2.7 Grid-stride loop
+固定 launch 为 `<<<64, 256>>>` 时，只有 `64 × 256 = 16384` 个 thread，远少于 `n = 2^24`。Grid-stride loop 让每个 thread 处理多个元素：
+
+```cpp
+for (int idx = threadIdx.x + blockIdx.x * blockDim.x;
+     idx < n;
+     idx += gridDim.x * blockDim.x) {
+    c[idx] = a[idx] + b[idx];
+}
+```
+
+步长是整个 grid 的 thread 总数。其价值是 kernel 不依赖“启动 thread 数必须覆盖 n”，可处理任意规模的数据。代价是本题只有 64 个 block，少于 GPU 的 170 个 SM，且每个 thread 要顺序处理大量元素，无法充分利用并行度。
+
+### 2.8 Block 执行顺序
+多次运行中 16 个 block 的打印顺序不同。block 的调度顺序由 GPU 硬件调度器和 SM 资源状态决定，不由 block 编号保证。
+
+正确性不能依赖 block 的执行先后。这使 CUDA 程序可扩展到不同规模的 GPU：独立 block 可被任意顺序、分批调度到任意可用 SM，结果仍应相同。
+
 ## 日常工作流：编辑、备份、运行
 
 ### 每次完成一小段本地工作后
@@ -88,7 +206,7 @@ git push origin main
 集群无法连接 GitHub，因此在 Mac 本地终端执行（首次同步整个目录）：
 
 ```bash
-scp -r -P 10029 "/Users/shuweili/Documents/Work/WMHPC x LCPU Infra Seminars/ai-infra-coursework" <手机号后8位>@221.238.13.179:~/
+scp -r -P 10029 "/Users/<用户名>/Documents/Work/WMHPC x LCPU Infra Seminars/ai-infra-coursework" <手机号后8位>@221.238.13.179:~/
 ```
 
 目标目录已存在后，不要直接重复整目录复制，以免产生嵌套目录。只同步本次改动的文件，例如：
@@ -107,4 +225,4 @@ make run/题目路径
 exit
 ```
 
-`srun` 申请 GPU；`exit` 退出并释放 GPU。运行产生的数据和新的笔记，应先同步回本地、提交并推送 GitHub。
+`srun` 申请 GPU；`exit` 退出并释放 GPU。本地是唯一编辑与保存来源；集群只用于运行测试。确认 PASS 后，在本地提交并推送 GitHub。
